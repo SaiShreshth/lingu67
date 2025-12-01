@@ -6,6 +6,8 @@ import hashlib
 import re
 import ast
 import uuid
+import threading
+import copy
 from datetime import datetime
 from typing import List, Dict, Any, Set
 
@@ -18,11 +20,12 @@ from llama_cpp import Llama
 # --- CONFIGURATION ---
 MODEL_PATH = "qwen2.5-3b-instruct-q4_k_m.gguf" 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-DB_PATH = "./qdrant_db" # Path for local Qdrant storage
+QDRANT_URL = "http://localhost:6333" 
 PROFILE_PATH = "./user_profile.json"
 CHAT_LOG_PATH = "./conversation_log.txt"
 
-CTX_SIZE = 4096
+# OPTIMIZATION: Restored to 4096 since VRAM is available
+CTX_SIZE = 4096 
 GPU_LAYERS = 35
 HISTORY_LIMIT = 15
 
@@ -37,20 +40,33 @@ logger.addHandler(console_handler)
 
 class SemanticRouter:
     def __init__(self, model_name: str):
-        print(f"Loading Router ({model_name})...")
-        self.model = SentenceTransformer(model_name, device='cpu')
+        # OPTIMIZATION: Moved to GPU to save System RAM
+        logger.info(f"Loading Router ({model_name}) on GPU...")
+        try:
+            self.model = SentenceTransformer(model_name, device='cuda')
+        except:
+            logger.warning("GPU Router failed, falling back to CPU.")
+            self.model = SentenceTransformer(model_name, device='cpu')
 
     def encode(self, text: str) -> List[float]:
         return self.model.encode(text).tolist()
 
 class Brain:
-    """The Intelligence (runs on GPU)."""
     def __init__(self, model_path: str, ctx_size: int, gpu_layers: int):
         if not os.path.exists(model_path):
             logger.critical(f"Model not found at {model_path}!")
             sys.exit(1)
         logger.info("Loading Brain on RTX 3050...")
-        self.llm = Llama(model_path=model_path, n_ctx=ctx_size, n_gpu_layers=gpu_layers, verbose=False)
+        
+        # OPTIMIZATION: use_mmap=True helps OS manage RAM better
+        self.llm = Llama(
+            model_path=model_path, 
+            n_ctx=ctx_size, 
+            n_gpu_layers=gpu_layers, 
+            verbose=False,
+            use_mmap=True 
+        )
+        self.lock = threading.Lock() 
 
     def extract_json_from_text(self, text: str) -> Dict:
         try:
@@ -62,79 +78,157 @@ class Brain:
         except: return {}
 
     def extract_keywords(self, text_chunk: str) -> str:
-        """Layer 2/3 Helper: Extracts search terms from found memories."""
         prompt = (
-            f"Text: \"{text_chunk[:500]}\"\n" # Limit chunk size for speed
-            f"Task: Extract 3-5 key entities, codes, or specific terms from the text above to use as a search query.\n"
+            f"Text: \"{text_chunk[:500]}\"\n" 
+            f"Task: Extract 3-5 key entities or terms from the text above to use as a search query.\n"
             f"Output ONLY the keywords separated by spaces."
         )
-        output = self.llm.create_completion(prompt, max_tokens=32, temperature=0.0)
+        with self.lock:
+            output = self.llm.create_completion(prompt, max_tokens=32, temperature=0.0)
         return output['choices'][0]['text'].strip()
+
+    def detect_file_intent(self, query: str) -> bool:
+        if any(w in query.lower() for w in ["upload", "ingest", "attach file", "read this file"]):
+            return True
+
+        sys_prompt = "You are an Intent Classifier."
+        user_prompt = (
+            f"User Input: '{query}'\n"
+            f"Task: Does this input indicate the user is ABOUT to upload or provide a file?\n"
+            f"Reply YES only if they say 'let me upload', 'here is the file', 'ingest this'.\n"
+            f"Reply NO if they are asking a question about an existing file.\n"
+            f"Answer (YES/NO):"
+        )
+        
+        with self.lock:
+            output = self.llm.create_chat_completion(
+                messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
+                max_tokens=5,
+                temperature=0.0
+            )
+        decision = output['choices'][0]['message']['content'].strip().upper()
+        return "YES" in decision
 
     def check_sufficiency(self, history: List[Dict], query: str) -> bool:
         if not history:
-            if "?" in query or any(w in query.lower() for w in ["what", "who", "where", "code", "value", "secret"]):
+            if "?" in query or any(w in query.lower() for w in ["what", "analyze", "check", "read", "file", "csv"]):
                 return False 
             return True
+            
+        if any(w in query.lower() for w in ["file", "csv", "document", "data", "analyze", "read", "summary"]):
+            return False
 
         prompt = (
             f"User Input: '{query}'\n"
-            f"Task: Does the AI need to search its long-term database to answer this?\n"
-            f"- If it's a greeting or statement -> NO.\n"
-            f"- If the answer is in the recent chat history -> NO.\n"
-            f"- If it asks about old facts, codes, or history -> YES.\n"
+            f"Task: Do we need to search the Database to answer this?\n"
             f"Answer (YES/NO):"
         )
-        output = self.llm.create_completion(prompt, max_tokens=3, temperature=0.0)
-        if "YES" in output['choices'][0]['text'].strip().upper():
-            return False 
+        with self.lock:
+            output = self.llm.create_completion(prompt, max_tokens=3, temperature=0.0)
+        decision = output['choices'][0]['text'].strip().upper()
+        
+        if "YES" in decision: return False 
         return True 
 
-    def extract_facts(self, user_input: str) -> Dict[str, str]:
-        sys_prompt = "You are a Memory Manager. Extract user facts (name, job) as JSON. If none, return {}."
-        output = self.llm.create_chat_completion(
-            messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_input}],
-            max_tokens=128, temperature=0.0
+    def consolidate_profile(self, current_profile_text: str, history: List[Dict], user_input: str, ai_response: str) -> Dict[str, str]:
+        recent_context = "\n".join([f"{m['role']}: {m['content']}" for m in history[-3:]])
+        sys_prompt = "You are a Profile Manager. Update the User's Permanent Profile JSON. Return JSON only."
+        user_prompt = (
+            f"--- CURRENT PROFILE ---\n{current_profile_text}\n"
+            f"--- INPUT ---\nUser: {user_input}\n"
+            f"Task: Extract NEW user facts (Name, Job, Preferences). Return {{}} if none."
         )
+        
+        with self.lock:
+            output = self.llm.create_chat_completion(
+                messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
+                max_tokens=128,
+                temperature=0.0
+            )
         return self.extract_json_from_text(output['choices'][0]['message']['content'])
 
     def generate_response(self, system_context: str, history: List[Dict], query: str) -> str:
         messages = [{"role": "system", "content": system_context}]
         messages.extend(history)
         messages.append({"role": "user", "content": query})
-        output = self.llm.create_chat_completion(messages=messages, max_tokens=512, temperature=0.7)
+        
+        with self.lock:
+            output = self.llm.create_chat_completion(messages=messages, max_tokens=512, temperature=0.7)
         return output['choices'][0]['message']['content']
 
 class MemoryManager:
-    def __init__(self, db_path: str, profile_path: str, log_path: str, router: SemanticRouter, brain: Brain):
+    def __init__(self, url: str, profile_path: str, log_path: str, router: SemanticRouter, brain: Brain):
         self.router = router
         self.brain = brain
         self.profile_path = profile_path
         self.log_path = log_path
         
-        # Initialize Qdrant Client (Local Persistence)
-        self.client = QdrantClient(path=db_path)
+        try:
+            self.client = QdrantClient(url=url)
+            if not hasattr(self.client, 'search'):
+                logger.critical("❌ ERROR: Installed 'qdrant-client' is too old! Run: pip install --upgrade qdrant-client")
+                sys.exit(1)
+            self.client.get_collections()
+        except Exception as e:
+            logger.critical(f"❌ Database Connection Failed: {e}")
+            sys.exit(1)
+
         self.collection_name = "episodic_memory"
-        
-        # Create collection if it doesn't exist
         self._init_collection()
         
         if not os.path.exists(self.profile_path):
             with open(self.profile_path, 'w') as f: json.dump({}, f)
 
     def _init_collection(self):
-        collections = self.client.get_collections()
-        collection_names = [c.name for c in collections.collections]
-        
-        if self.collection_name not in collection_names:
+        try:
+            self.client.get_collection(self.collection_name)
+        except:
             logger.info(f"Creating Qdrant collection '{self.collection_name}'...")
             self.client.create_collection(
                 collection_name=self.collection_name,
                 vectors_config=models.VectorParams(
-                    size=384,  # Dimension size for all-MiniLM-L6-v2
+                    size=384, 
                     distance=models.Distance.COSINE
                 )
             )
+
+    def ingest_file(self, file_path: str):
+        if not os.path.exists(file_path):
+            print(f"\033[91m[System: File not found at {file_path}]\033[0m")
+            return
+
+        try:
+            filename = os.path.basename(file_path)
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f: text = f.read()
+            except UnicodeDecodeError:
+                with open(file_path, 'r', encoding='latin-1') as f: text = f.read()
+            
+            chunk_size = 512
+            overlap = 50
+            chunks = []
+            for i in range(0, len(text), chunk_size - overlap):
+                chunks.append(text[i:i + chunk_size])
+            
+            print(f"\033[90m[System: Processing {len(chunks)} chunks from {filename}...]\033[0m")
+            
+            points = []
+            for i, chunk in enumerate(chunks):
+                augmented_chunk = f"[File: {filename} Part {i}] \n{chunk}"
+                vector = self.router.encode(augmented_chunk)
+                doc_id = str(uuid.uuid4())
+                
+                points.append(models.PointStruct(
+                    id=doc_id,
+                    vector=vector,
+                    payload={"text": augmented_chunk, "source": filename, "timestamp": datetime.now().isoformat()}
+                ))
+            
+            self.client.upsert(collection_name=self.collection_name, points=points)
+            print(f"\033[92m[System: Successfully ingested {filename} into Long-Term Memory]\033[0m")
+            
+        except Exception as e:
+            logger.error(f"Ingestion Error: {e}")
 
     def get_profile(self) -> str:
         try:
@@ -144,17 +238,29 @@ class MemoryManager:
             return f"User Facts & Reminders:\n{json.dumps(data, indent=2)}"
         except: return ""
 
+    def get_raw_profile_json(self) -> str:
+        try:
+            with open(self.profile_path, 'r') as f: return f.read()
+        except: return "{}"
+
     def update_profile(self, new_facts: Dict[str, str]):
         data = {}
         try:
             with open(self.profile_path, 'r') as f: data = json.load(f)
         except: pass
-        data.update(new_facts)
-        with open(self.profile_path, 'w') as f: json.dump(data, f, indent=2)
-        print(f"\033[90m[Memory: Learned new fact: {new_facts}]\033[0m")
+        
+        updated = False
+        for k, v in new_facts.items():
+            if k not in data or data[k] != v:
+                data[k] = v
+                updated = True
+        
+        if updated:
+            with open(self.profile_path, 'w') as f: json.dump(data, f, indent=2)
+            print(f"\n\033[95m[Background Update: Learned new fact -> {new_facts}]\033[0m")
+            print("\033[94mYou:\033[0m ", end="", flush=True)
 
     def search_layer(self, query_text: str, n_results: int = 5) -> List[str]:
-        """Helper: Performs a single vector search using Qdrant."""
         try:
             vector = self.router.encode(query_text)
             search_result = self.client.search(
@@ -162,94 +268,80 @@ class MemoryManager:
                 query_vector=vector,
                 limit=n_results
             )
-            
-            # Extract text payloads from results
             memories = [hit.payload['text'] for hit in search_result if hit.payload]
             return memories
         except Exception as e:
             logger.error(f"Layer Search Error: {e}")
-        return []
+            return []
 
     def search_episodic(self, user_query: str) -> str:
-        """
-        3-Layer Deep Search Algorithm
-        """
         unique_memories: Set[str] = set()
-        
-        # --- Layer 1: Direct User Query ---
         print("\033[90m  -> Layer 1: Searching User Input...\033[0m")
         layer1_results = self.search_layer(user_query, n_results=5)
         unique_memories.update(layer1_results)
         
-        # Combine L1 results to extract keywords
         if layer1_results:
             l1_context = " ".join(layer1_results)
-            
-            # --- Layer 2: Derived Keywords ---
             keywords_l2 = self.brain.extract_keywords(l1_context)
             print(f"\033[90m  -> Layer 2: Searching Keywords '{keywords_l2}'...\033[0m")
             layer2_results = self.search_layer(keywords_l2, n_results=5)
             unique_memories.update(layer2_results)
             
-            if layer2_results:
+            if layer2_results and ("analyze" in user_query.lower() or "file" in user_query.lower()):
                 l2_context = " ".join(layer2_results)
-                
-                # --- Layer 3: Deep Dive ---
                 keywords_l3 = self.brain.extract_keywords(l2_context)
                 print(f"\033[90m  -> Layer 3: Searching Keywords '{keywords_l3}'...\033[0m")
                 layer3_results = self.search_layer(keywords_l3, n_results=5)
                 unique_memories.update(layer3_results)
 
-        # Final Processing
         print(f"\033[93m[Deep Search: Found {len(unique_memories)} unique memories]\033[0m")
-        
-        if not unique_memories:
-            return "No relevant memories found."
-            
+        if not unique_memories: return "No relevant memories found."
         return "Deep Search Memories:\n" + "\n".join([f"- {m}" for m in unique_memories])
 
     def recall_recent(self, n_last: int = 5) -> str:
+        """OPTIMIZED: Only reads the last few KB of the file, preserving RAM."""
         if not os.path.exists(self.log_path): return ""
         try:
-            with open(self.log_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            interactions = [i.strip() for i in content.split('-'*20) if i.strip()]
-            return "Recent Conversation History (Chronological):\n" + "\n---\n".join(interactions[-n_last:])
+            # Read only last 2000 bytes (~30 lines) instead of whole file
+            with open(self.log_path, 'rb') as f:
+                try:
+                    f.seek(-2048, os.SEEK_END)
+                except OSError:
+                    pass # File is smaller than 2KB
+                last_chunk = f.read().decode('utf-8', errors='ignore')
+            
+            interactions = [i.strip() for i in last_chunk.split('-'*20) if i.strip()]
+            return "Recent Conversation History:\n" + "\n---\n".join(interactions[-n_last:])
         except: return ""
 
     def save_interaction(self, user_input: str, ai_response: str):
         text_blob = f"User: {user_input} | AI: {ai_response}"
         vector = self.router.encode(text_blob)
-        
-        # Create a deterministic UUID based on content
-        doc_hash = hashlib.md5(text_blob.encode()).hexdigest()
-        doc_uuid = str(uuid.UUID(doc_hash))
+        doc_uuid = str(uuid.UUID(hashlib.md5(text_blob.encode()).hexdigest()))
         
         self.client.upsert(
             collection_name=self.collection_name,
-            points=[
-                models.PointStruct(
-                    id=doc_uuid,
-                    vector=vector,
-                    payload={
-                        "text": text_blob,
-                        "timestamp": datetime.now().isoformat()
-                    }
-                )
-            ]
+            points=[models.PointStruct(id=doc_uuid, vector=vector, payload={"text": text_blob, "timestamp": datetime.now().isoformat()})]
         )
         
         with open(self.log_path, "a", encoding="utf-8") as f:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             f.write(f"[{timestamp}]\nUser: {user_input}\nAI: {ai_response}\n{'-'*20}\n")
 
+def background_profile_update(brain, memory, profile_text, history_copy, user_input, response):
+    try:
+        new_facts = brain.consolidate_profile(profile_text, history_copy, user_input, response)
+        if new_facts:
+            memory.update_profile(new_facts)
+    except Exception as e:
+        logger.error(f"Background Update Failed: {e}")
+
 def main():
-    print("=== Booting Up Memory System v2.8 (3-Layer Deep Search) ===")
+    print("=== Booting Up Memory System v3.6 (GPU Shift) ===")
     try:
         router = SemanticRouter(EMBEDDING_MODEL)
         brain = Brain(MODEL_PATH, CTX_SIZE, GPU_LAYERS)
-        # Pass brain to memory manager for keyword extraction
-        memory = MemoryManager(DB_PATH, PROFILE_PATH, CHAT_LOG_PATH, router, brain)
+        memory = MemoryManager(QDRANT_URL, PROFILE_PATH, CHAT_LOG_PATH, router, brain)
     except Exception as e:
         logger.critical(f"Startup Failed: {e}")
         return
@@ -264,24 +356,37 @@ def main():
                 print("Saving and shutting down...")
                 break
 
+            # --- FEATURE: File Ingestion Check ---
+            is_upload = brain.detect_file_intent(user_input)
+            if is_upload:
+                confirm = input("\033[93m[System] Did you mean to upload a file? (y/n): \033[0m")
+                if confirm.lower() == 'y':
+                    path = input("\033[93m[System] Enter absolute file path: \033[0m").strip('"') 
+                    memory.ingest_file(path)
+                    short_term_history.append({"role": "system", "content": f"User uploaded file: {os.path.basename(path)}"})
+                    continue 
+            
+            # --- Normal Flow ---
             is_sufficient = brain.check_sufficiency(short_term_history, user_input)
             
             long_term_context = ""
             if not is_sufficient:
-                print("\033[90m[Thinking: Starting 3-Layer Deep Search...]\033[0m")
+                print("\033[90m[Thinking: Searching Long-Term...]\033[0m")
                 vector_memories = memory.search_episodic(user_input)
                 recent_memories = memory.recall_recent(n_last=5)
                 long_term_context = f"{vector_memories}\n\n{recent_memories}"
             
             persistent_profile = memory.get_profile()
+            raw_profile_json = memory.get_raw_profile_json()
 
             system_prompt = (
                 f"You are a helpful assistant.\n"
                 f"--- LONG TERM MEMORY ---\n{long_term_context}\n"
-                f"--- USER PROFILE ---\n{persistent_profile}\n"
                 f"--- INSTRUCTIONS ---\n"
-                f"1. Use the Deep Search Memories to find specific codes or facts.\n"
-                f"2. Prioritize the Chat History below if it contradicts older memories."
+                f"1. Use the memory above to answer questions.\n"
+                f"2. If the answer is in a [File: ...] block, use that data.\n"
+                f"3. ALWAYS adhere to the User Profile below for facts about the user.\n"
+                f"{persistent_profile}"
             )
 
             response = brain.generate_response(system_prompt, short_term_history, user_input)
@@ -294,9 +399,13 @@ def main():
 
             memory.save_interaction(user_input, response)
 
-            new_facts = brain.extract_facts(user_input)
-            if new_facts:
-                memory.update_profile(new_facts)
+            history_snapshot = copy.deepcopy(short_term_history)
+            t = threading.Thread(
+                target=background_profile_update,
+                args=(brain, memory, raw_profile_json, history_snapshot, user_input, response),
+                daemon=True
+            )
+            t.start()
 
         except KeyboardInterrupt:
             print("\nShutdown.")
