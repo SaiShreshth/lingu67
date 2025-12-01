@@ -5,18 +5,20 @@ import logging
 import hashlib
 import re
 import ast
+import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Set
 
 # Third-party imports
-import chromadb
+from qdrant_client import QdrantClient
+from qdrant_client.http import models
 from sentence_transformers import SentenceTransformer
 from llama_cpp import Llama
 
 # --- CONFIGURATION ---
 MODEL_PATH = "qwen2.5-3b-instruct-q4_k_m.gguf" 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-DB_PATH = "./memory_db"
+DB_PATH = "./qdrant_db" # Path for local Qdrant storage
 PROFILE_PATH = "./user_profile.json"
 CHAT_LOG_PATH = "./conversation_log.txt"
 
@@ -109,11 +111,30 @@ class MemoryManager:
         self.brain = brain
         self.profile_path = profile_path
         self.log_path = log_path
-        self.client = chromadb.PersistentClient(path=db_path)
-        self.collection = self.client.get_or_create_collection(name="episodic_memory")
+        
+        # Initialize Qdrant Client (Local Persistence)
+        self.client = QdrantClient(path=db_path)
+        self.collection_name = "episodic_memory"
+        
+        # Create collection if it doesn't exist
+        self._init_collection()
         
         if not os.path.exists(self.profile_path):
             with open(self.profile_path, 'w') as f: json.dump({}, f)
+
+    def _init_collection(self):
+        collections = self.client.get_collections()
+        collection_names = [c.name for c in collections.collections]
+        
+        if self.collection_name not in collection_names:
+            logger.info(f"Creating Qdrant collection '{self.collection_name}'...")
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=models.VectorParams(
+                    size=384,  # Dimension size for all-MiniLM-L6-v2
+                    distance=models.Distance.COSINE
+                )
+            )
 
     def get_profile(self) -> str:
         try:
@@ -133,12 +154,18 @@ class MemoryManager:
         print(f"\033[90m[Memory: Learned new fact: {new_facts}]\033[0m")
 
     def search_layer(self, query_text: str, n_results: int = 5) -> List[str]:
-        """Helper: Performs a single vector search."""
+        """Helper: Performs a single vector search using Qdrant."""
         try:
             vector = self.router.encode(query_text)
-            results = self.collection.query(query_embeddings=[vector], n_results=n_results)
-            if results['documents'] and results['documents'][0]:
-                return results['documents'][0]
+            search_result = self.client.search(
+                collection_name=self.collection_name,
+                query_vector=vector,
+                limit=n_results
+            )
+            
+            # Extract text payloads from results
+            memories = [hit.payload['text'] for hit in search_result if hit.payload]
+            return memories
         except Exception as e:
             logger.error(f"Layer Search Error: {e}")
         return []
@@ -193,10 +220,25 @@ class MemoryManager:
     def save_interaction(self, user_input: str, ai_response: str):
         text_blob = f"User: {user_input} | AI: {ai_response}"
         vector = self.router.encode(text_blob)
-        doc_id = hashlib.md5(text_blob.encode()).hexdigest()
-        self.collection.add(documents=[text_blob], embeddings=[vector], ids=[doc_id])
-        try: self.client.heartbeat() 
-        except: pass
+        
+        # Create a deterministic UUID based on content
+        doc_hash = hashlib.md5(text_blob.encode()).hexdigest()
+        doc_uuid = str(uuid.UUID(doc_hash))
+        
+        self.client.upsert(
+            collection_name=self.collection_name,
+            points=[
+                models.PointStruct(
+                    id=doc_uuid,
+                    vector=vector,
+                    payload={
+                        "text": text_blob,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                )
+            ]
+        )
+        
         with open(self.log_path, "a", encoding="utf-8") as f:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             f.write(f"[{timestamp}]\nUser: {user_input}\nAI: {ai_response}\n{'-'*20}\n")
