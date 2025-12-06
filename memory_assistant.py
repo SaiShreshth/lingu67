@@ -23,6 +23,7 @@ EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 QDRANT_URL = "http://localhost:6333" 
 PROFILE_PATH = "./user_profile.json"
 CHAT_LOG_PATH = "./conversation_log.txt"
+FILE_METADATA_PATH = "./file_metadata.json"  # NEW: Track uploaded files
 
 # OPTIMIZATION: Restored to 4096 since VRAM is available
 CTX_SIZE = 4096 
@@ -162,12 +163,11 @@ class MemoryManager:
         self.brain = brain
         self.profile_path = profile_path
         self.log_path = log_path
+        self.file_metadata_path = FILE_METADATA_PATH  # NEW
         
         try:
             self.client = QdrantClient(url=url)
-            if not hasattr(self.client, 'search'):
-                logger.critical("❌ ERROR: Installed 'qdrant-client' is too old! Run: pip install --upgrade qdrant-client")
-                sys.exit(1)
+            # Version check removed as it was causing false positives with v1.16.1
             self.client.get_collections()
         except Exception as e:
             logger.critical(f"❌ Database Connection Failed: {e}")
@@ -178,6 +178,9 @@ class MemoryManager:
         
         if not os.path.exists(self.profile_path):
             with open(self.profile_path, 'w') as f: json.dump({}, f)
+        
+        # NEW: Load file metadata on startup
+        self.uploaded_files = self._load_file_metadata()
 
     def _init_collection(self):
         try:
@@ -191,7 +194,28 @@ class MemoryManager:
                     distance=models.Distance.COSINE
                 )
             )
+    
+    # NEW: File metadata persistence
+    def _load_file_metadata(self) -> Dict[str, Dict]:
+        """Load file metadata from disk."""
+        if not os.path.exists(self.file_metadata_path):
+            return {}
+        try:
+            with open(self.file_metadata_path, 'r') as f:
+                return json.load(f)
+        except:
+            logger.warning("Failed to load file metadata, starting fresh")
+            return {}
+    
+    def _save_file_metadata(self):
+        """Save file metadata to disk."""
+        try:
+            with open(self.file_metadata_path, 'w') as f:
+                json.dump(self.uploaded_files, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save file metadata: {e}")
 
+    # ENHANCED: Track uploaded files with their metadata
     def ingest_file(self, file_path: str):
         if not os.path.exists(file_path):
             print(f"\033[91m[System: File not found at {file_path}]\033[0m")
@@ -212,23 +236,90 @@ class MemoryManager:
             
             print(f"\033[90m[System: Processing {len(chunks)} chunks from {filename}...]\033[0m")
             
+            # NEW: Track point IDs for this file
+            point_ids = []
             points = []
             for i, chunk in enumerate(chunks):
                 augmented_chunk = f"[File: {filename} Part {i}] \n{chunk}"
                 vector = self.router.encode(augmented_chunk)
                 doc_id = str(uuid.uuid4())
+                point_ids.append(doc_id)  # NEW: Track IDs
                 
                 points.append(models.PointStruct(
                     id=doc_id,
                     vector=vector,
-                    payload={"text": augmented_chunk, "source": filename, "timestamp": datetime.now().isoformat()}
+                    payload={"text": augmented_chunk, "source": filename, "type": "file", "timestamp": datetime.now().isoformat()}
                 ))
             
             self.client.upsert(collection_name=self.collection_name, points=points)
+            
+            # NEW: Save metadata
+            self.uploaded_files[filename] = {
+                "point_ids": point_ids,
+                "chunk_count": len(chunks),
+                "upload_date": datetime.now().isoformat(),
+                "file_path": file_path
+            }
+            self._save_file_metadata()
+            
             print(f"\033[92m[System: Successfully ingested {filename} into Long-Term Memory]\033[0m")
             
         except Exception as e:
             logger.error(f"Ingestion Error: {e}")
+    
+    # NEW: Search for specific file content using Qdrant filters
+    def search_by_filename(self, filename: str, n_results: int = 10) -> List[str]:
+        """Retrieve all chunks from a specific file using Qdrant filtering."""
+        try:
+            # Create a dummy vector for filtering (Qdrant requires a vector for search)
+            dummy_query = f"file {filename}"
+            vector = self.router.encode(dummy_query)
+            
+            # Search with filter for specific filename
+            search_result = self.client.query_points(
+                collection_name=self.collection_name,
+                query=vector,
+                query_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="source",
+                            match=models.MatchValue(value=filename)
+                        )
+                    ]
+                ),
+                limit=n_results
+            ).points
+            memories = [hit.payload['text'] for hit in search_result if hit.payload]
+            return memories
+        except Exception as e:
+            logger.error(f"File-specific search error: {e}")
+            return []
+    
+    # NEW: Get list of uploaded files
+    def get_uploaded_files_list(self) -> str:
+        """Return a formatted list of uploaded files."""
+        if not self.uploaded_files:
+            return "No files uploaded yet."
+        
+        file_list = ["Uploaded Files:"]
+        for filename, metadata in self.uploaded_files.items():
+            upload_date = metadata.get('upload_date', 'Unknown')
+            chunk_count = metadata.get('chunk_count', 0)
+            file_list.append(f"  - {filename} ({chunk_count} chunks, uploaded: {upload_date[:10]})")
+        
+        return "\n".join(file_list)
+    
+    # NEW: Detect if query mentions specific filename
+    def detect_filename_in_query(self, query: str) -> List[str]:
+        """Detect if user mentions any uploaded filenames in their query."""
+        mentioned_files = []
+        query_lower = query.lower()
+        for filename in self.uploaded_files.keys():
+            # Check for exact filename or basename without extension
+            base_name = os.path.splitext(filename)[0].lower()
+            if filename.lower() in query_lower or base_name in query_lower:
+                mentioned_files.append(filename)
+        return mentioned_files
 
     def get_profile(self) -> str:
         try:
@@ -263,19 +354,30 @@ class MemoryManager:
     def search_layer(self, query_text: str, n_results: int = 5) -> List[str]:
         try:
             vector = self.router.encode(query_text)
-            search_result = self.client.search(
+            search_result = self.client.query_points(
                 collection_name=self.collection_name,
-                query_vector=vector,
+                query=vector,
                 limit=n_results
-            )
+            ).points
             memories = [hit.payload['text'] for hit in search_result if hit.payload]
             return memories
         except Exception as e:
             logger.error(f"Layer Search Error: {e}")
             return []
 
+    # ENHANCED: Improved episodic search with file-specific routing
     def search_episodic(self, user_query: str) -> str:
         unique_memories: Set[str] = set()
+        
+        # NEW: Check if user mentions specific files
+        mentioned_files = self.detect_filename_in_query(user_query)
+        if mentioned_files:
+            print(f"\033[90m  -> Detected file mention: {', '.join(mentioned_files)}\033[0m")
+            for filename in mentioned_files:
+                file_memories = self.search_by_filename(filename, n_results=8)
+                unique_memories.update(file_memories)
+                print(f"\033[90m  -> Retrieved {len(file_memories)} chunks from {filename}\033[0m")
+        
         print("\033[90m  -> Layer 1: Searching User Input...\033[0m")
         layer1_results = self.search_layer(user_query, n_results=5)
         unique_memories.update(layer1_results)
@@ -321,7 +423,7 @@ class MemoryManager:
         
         self.client.upsert(
             collection_name=self.collection_name,
-            points=[models.PointStruct(id=doc_uuid, vector=vector, payload={"text": text_blob, "timestamp": datetime.now().isoformat()})]
+            points=[models.PointStruct(id=doc_uuid, vector=vector, payload={"text": text_blob, "type": "conversation", "timestamp": datetime.now().isoformat()})]
         )
         
         with open(self.log_path, "a", encoding="utf-8") as f:
@@ -337,7 +439,7 @@ def background_profile_update(brain, memory, profile_text, history_copy, user_in
         logger.error(f"Background Update Failed: {e}")
 
 def main():
-    print("=== Booting Up Memory System v3.6 (GPU Shift) ===")
+    print("=== Booting Up Memory System v3.7 (Enhanced File Retrieval) ===")
     try:
         router = SemanticRouter(EMBEDDING_MODEL)
         brain = Brain(MODEL_PATH, CTX_SIZE, GPU_LAYERS)
@@ -347,7 +449,7 @@ def main():
         return
 
     short_term_history = [] 
-    print("\n>>> Model Ready. Type 'exit' to quit.\n")
+    print("\n>>> Model Ready. Type 'exit' to quit, 'files' to list uploaded files.\n")
 
     while True:
         try:
@@ -355,6 +457,11 @@ def main():
             if user_input.lower() in ['exit', 'quit']:
                 print("Saving and shutting down...")
                 break
+            
+            # NEW: List files command
+            if user_input.lower() == 'files':
+                print(f"\033[96m{memory.get_uploaded_files_list()}\033[0m")
+                continue
 
             # --- FEATURE: File Ingestion Check ---
             is_upload = brain.detect_file_intent(user_input)
@@ -378,14 +485,19 @@ def main():
             
             persistent_profile = memory.get_profile()
             raw_profile_json = memory.get_raw_profile_json()
+            
+            # ENHANCED: Include uploaded files list in system prompt
+            uploaded_files_context = memory.get_uploaded_files_list()
 
             system_prompt = (
                 f"You are a helpful assistant.\n"
                 f"--- LONG TERM MEMORY ---\n{long_term_context}\n"
+                f"--- AVAILABLE FILES ---\n{uploaded_files_context}\n"
                 f"--- INSTRUCTIONS ---\n"
                 f"1. Use the memory above to answer questions.\n"
                 f"2. If the answer is in a [File: ...] block, use that data.\n"
-                f"3. ALWAYS adhere to the User Profile below for facts about the user.\n"
+                f"3. When user asks about files, reference the AVAILABLE FILES list.\n"
+                f"4. ALWAYS adhere to the User Profile below for facts about the user.\n"
                 f"{persistent_profile}"
             )
 
