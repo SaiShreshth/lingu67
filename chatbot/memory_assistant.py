@@ -14,21 +14,22 @@ from typing import List, Dict, Any, Set
 # Third-party imports
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-from sentence_transformers import SentenceTransformer
-from llama_cpp import Llama
+from local_client import LocalLLMClient
 
 # --- CONFIGURATION ---
-MODEL_PATH = "qwen2.5-3b-instruct-q4_k_m.gguf" 
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-QDRANT_URL = "http://localhost:6333" 
+LLM_API_URL = "http://localhost:8000"  # Local FastAPI server
+QDRANT_PATH = "./qdrant_local"  # Local file-based Qdrant storage (no Docker needed)
 PROFILE_PATH = "./user_profile.json"
 CHAT_LOG_PATH = "./conversation_log.txt"
-FILE_METADATA_PATH = "./file_metadata.json"  # NEW: Track uploaded files
+FILE_METADATA_PATH = "./file_metadata.json"
 
-# OPTIMIZATION: Restored to 4096 since VRAM is available
 CTX_SIZE = 4096 
-GPU_LAYERS = 35
 HISTORY_LIMIT = 15
+
+# Context overflow management
+MAX_TOKENS_PER_MESSAGE = 512
+CONTEXT_SAFETY_MARGIN = 500
+OVERFLOW_STORAGE_PATH = "./context_overflow.json"
 
 # --- LOGGING ---
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -40,34 +41,98 @@ logger.setLevel(logging.INFO)
 logger.addHandler(console_handler)
 
 class SemanticRouter:
-    def __init__(self, model_name: str):
-        # OPTIMIZATION: Moved to GPU to save System RAM
-        logger.info(f"Loading Router ({model_name}) on GPU...")
-        try:
-            self.model = SentenceTransformer(model_name, device='cuda')
-        except:
-            logger.warning("GPU Router failed, falling back to CPU.")
-            self.model = SentenceTransformer(model_name, device='cpu')
+    def __init__(self, api_url: str):
+        self.llm_client = LocalLLMClient(api_url)
+        logger.info(f"✓ Using embedding API at {api_url}")
 
     def encode(self, text: str) -> List[float]:
-        return self.model.encode(text).tolist()
+        return self.llm_client.embed(text)
 
 class Brain:
-    def __init__(self, model_path: str, ctx_size: int, gpu_layers: int):
-        if not os.path.exists(model_path):
-            logger.critical(f"Model not found at {model_path}!")
-            sys.exit(1)
-        logger.info("Loading Brain on RTX 3050...")
+    def __init__(self, api_url: str, ctx_size: int):
+        self.ctx_size = ctx_size
+        self.llm_client = LocalLLMClient(api_url)
+        self.overflow_storage = []
+        self._load_overflow_context()
+        logger.info(f"✓ Connected to LLM API at {api_url}")
+        self.lock = threading.Lock()
+    
+    def _load_overflow_context(self):
+        """Load previously overflowed context from disk"""
+        try:
+            if os.path.exists(OVERFLOW_STORAGE_PATH):
+                with open(OVERFLOW_STORAGE_PATH, 'r') as f:
+                    self.overflow_storage = json.load(f)
+                logger.info(f"Loaded {len(self.overflow_storage)} overflow messages")
+        except Exception as e:
+            logger.warning(f"Could not load overflow context: {e}")
+            self.overflow_storage = []
+
+    def _save_overflow_context(self):
+        """Save overflowed context to disk"""
+        try:
+            with open(OVERFLOW_STORAGE_PATH, 'w') as f:
+                json.dump(self.overflow_storage, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save overflow context: {e}")
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Rough estimation: 1 token ≈ 4 characters"""
+        return len(text) // 4
+
+    def _manage_context_window(self, messages: List[Dict]) -> List[Dict]:
+        """Manage context window, moving overflow to storage"""
+        total_tokens = sum(self._estimate_tokens(m.get('content', '')) for m in messages)
+        available_tokens = self.ctx_size - CONTEXT_SAFETY_MARGIN - 512  # Reserve for response
         
-        # OPTIMIZATION: use_mmap=True helps OS manage RAM better
-        self.llm = Llama(
-            model_path=model_path, 
-            n_ctx=ctx_size, 
-            n_gpu_layers=gpu_layers, 
-            verbose=False,
-            use_mmap=True 
-        )
-        self.lock = threading.Lock() 
+        if total_tokens <= available_tokens:
+            return messages
+        
+        logger.info(f"Context overflow: {total_tokens} tokens > {available_tokens} available")
+        
+        # Separate system and other messages
+        system_msgs = [m for m in messages if m.get('role') == 'system']
+        other_msgs = [m for m in messages if m.get('role') != 'system']
+        
+        # First, truncate system messages if they're too long
+        system_tokens = sum(self._estimate_tokens(m.get('content', '')) for m in system_msgs)
+        max_system_tokens = available_tokens // 2  # Allow system to use at most 50% of context
+        
+        if system_tokens > max_system_tokens:
+            logger.info(f"System message too long ({system_tokens} tokens), truncating to {max_system_tokens}")
+            # Truncate each system message proportionally
+            for msg in system_msgs:
+                content = msg.get('content', '')
+                msg_tokens = self._estimate_tokens(content)
+                if msg_tokens > max_system_tokens:
+                    # Keep roughly the right number of characters
+                    target_chars = max_system_tokens * 4
+                    msg['content'] = content[:target_chars] + "\n...[truncated for context limit]"
+            system_tokens = max_system_tokens
+        
+        remaining_tokens = available_tokens - system_tokens
+        
+        # Now fit as many conversation messages as possible
+        kept_messages = []
+        overflow_messages = []
+        current_tokens = 0
+        
+        for msg in reversed(other_msgs):
+            msg_tokens = self._estimate_tokens(msg.get('content', ''))
+            if current_tokens + msg_tokens <= remaining_tokens:
+                kept_messages.insert(0, msg)
+                current_tokens += msg_tokens
+            else:
+                overflow_messages.insert(0, msg)
+        
+        # Store overflow messages
+        if overflow_messages:
+            self.overflow_storage.extend(overflow_messages)
+            self.overflow_storage = self.overflow_storage[-50:]  # Keep only last 50
+            self._save_overflow_context()
+            logger.info(f"Moved {len(overflow_messages)} messages to overflow storage")
+        
+        return system_msgs + kept_messages 
 
     def extract_json_from_text(self, text: str) -> Dict:
         try:
@@ -85,8 +150,8 @@ class Brain:
             f"Output ONLY the keywords separated by spaces."
         )
         with self.lock:
-            output = self.llm.create_completion(prompt, max_tokens=32, temperature=0.0)
-        return output['choices'][0]['text'].strip()
+            output = self.llm_client.complete(prompt, max_tokens=32, temperature=0.0)
+        return output.strip()
 
     def detect_file_intent(self, query: str) -> bool:
         if any(w in query.lower() for w in ["upload", "ingest", "attach file", "read this file"]):
@@ -102,12 +167,12 @@ class Brain:
         )
         
         with self.lock:
-            output = self.llm.create_chat_completion(
+            output = self.llm_client.chat(
                 messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
                 max_tokens=5,
                 temperature=0.0
             )
-        decision = output['choices'][0]['message']['content'].strip().upper()
+        decision = output.strip().upper()
         return "YES" in decision
 
     def check_sufficiency(self, history: List[Dict], query: str) -> bool:
@@ -125,8 +190,8 @@ class Brain:
             f"Answer (YES/NO):"
         )
         with self.lock:
-            output = self.llm.create_completion(prompt, max_tokens=3, temperature=0.0)
-        decision = output['choices'][0]['text'].strip().upper()
+            output = self.llm_client.complete(prompt, max_tokens=3, temperature=0.0)
+        decision = output.strip().upper()
         
         if "YES" in decision: return False 
         return True 
@@ -141,24 +206,87 @@ class Brain:
         )
         
         with self.lock:
-            output = self.llm.create_chat_completion(
+            output = self.llm_client.chat(
                 messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
                 max_tokens=128,
                 temperature=0.0
             )
-        return self.extract_json_from_text(output['choices'][0]['message']['content'])
+        return self.extract_json_from_text(output)
 
-    def generate_response(self, system_context: str, history: List[Dict], query: str) -> str:
+    def _summarize_overflow(self) -> str:
+        """Create a brief summary of overflow context"""
+        if not self.overflow_storage:
+            return ""
+        
+        recent_overflow = self.overflow_storage[-10:]
+        overflow_text = "\n".join([f"{m.get('role', 'unknown')}: {m.get('content', '')[:100]}" for m in recent_overflow])
+        
+        prompt = f"Briefly summarize this conversation history in 2-3 sentences:\n{overflow_text}"
+        try:
+            summary = self.llm_client.complete(prompt, max_tokens=128, temperature=0.3)
+            return summary.strip()
+        except:
+            return ""
+
+    def _recursive_process(self, system_prompt: str, context_parts: List[str], query: str) -> str:
+        """Process large context recursively by summarizing chunks"""
+        if len(context_parts) <= 1:
+            full_context = context_parts[0] if context_parts else ""
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Context: {full_context}\n\nQuestion: {query}"}
+            ]
+            response = self.llm_client.chat(messages, max_tokens=512, temperature=0.7)
+            return response
+        
+        # Recursive case: summarize chunks first
+        summaries = []
+        for i, part in enumerate(context_parts):
+            logger.info(f"Processing context chunk {i+1}/{len(context_parts)}")
+            summary_prompt = f"Summarize the key information from this context:\n{part[:1500]}"
+            messages = [
+                {"role": "system", "content": "You are a summarization assistant."},
+                {"role": "user", "content": summary_prompt}
+            ]
+            summary = self.llm_client.chat(messages, max_tokens=256, temperature=0.3)
+            summaries.append(summary)
+        
+        # Combine summaries and answer
+        combined_summary = "\n\n".join(summaries)
+        final_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Summarized Context: {combined_summary}\n\nQuestion: {query}"}
+        ]
+        response = self.llm_client.chat(final_messages, max_tokens=512, temperature=0.7)
+        return response
+
+    def generate_response(self, system_context: str, history: List[Dict], query: str, use_overflow: bool = False) -> str:
         messages = [{"role": "system", "content": system_context}]
+        
+        if use_overflow and self.overflow_storage:
+            overflow_summary = self._summarize_overflow()
+            if overflow_summary:
+                messages.append({"role": "system", "content": f"Previous context summary: {overflow_summary}"})
+        
         messages.extend(history)
         messages.append({"role": "user", "content": query})
         
-        with self.lock:
-            output = self.llm.create_chat_completion(messages=messages, max_tokens=512, temperature=0.7)
-        return output['choices'][0]['message']['content']
+        # Manage context window BEFORE sending
+        managed_messages = self._manage_context_window(messages)
+        
+        # Double-check total size
+        total_tokens = sum(self._estimate_tokens(m.get('content', '')) for m in managed_messages)
+        logger.info(f"Sending {len(managed_messages)} messages (~{total_tokens} tokens) to LLM")
+        
+        response = self.llm_client.chat(managed_messages, max_tokens=512, temperature=0.7)
+        return response
+    
+    def generate_response_with_large_context(self, system_context: str, context_chunks: List[str], query: str) -> str:
+        """Generate response when context is too large - uses recursive processing"""
+        return self._recursive_process(system_context, context_chunks, query)
 
 class MemoryManager:
-    def __init__(self, url: str, profile_path: str, log_path: str, router: SemanticRouter, brain: Brain):
+    def __init__(self, qdrant_path: str, profile_path: str, log_path: str, router: SemanticRouter, brain: Brain):
         self.router = router
         self.brain = brain
         self.profile_path = profile_path
@@ -166,9 +294,9 @@ class MemoryManager:
         self.file_metadata_path = FILE_METADATA_PATH  # NEW
         
         try:
-            self.client = QdrantClient(url=url)
-            # Version check removed as it was causing false positives with v1.16.1
-            self.client.get_collections()
+            # Use local file-based storage instead of Docker server
+            self.client = QdrantClient(path=qdrant_path)
+            logger.info(f"✓ Connected to local Qdrant at {qdrant_path}")
         except Exception as e:
             logger.critical(f"❌ Database Connection Failed: {e}")
             sys.exit(1)
@@ -271,7 +399,7 @@ class MemoryManager:
     def search_by_filename(self, filename: str, n_results: int = 10) -> List[str]:
         """Retrieve all chunks from a specific file using Qdrant filtering."""
         try:
-            # Create a dummy vector for filtering (Qdrant requires a vector for search)
+            # Create a dummy vector for filtering
             dummy_query = f"file {filename}"
             vector = self.router.encode(dummy_query)
             
@@ -287,12 +415,20 @@ class MemoryManager:
                         )
                     ]
                 ),
-                limit=n_results
-            ).points
-            memories = [hit.payload['text'] for hit in search_result if hit.payload]
+                limit=n_results,
+                with_payload=True
+            )
+            
+            # Handle response - it returns QueryResponse object
+            if hasattr(search_result, 'points'):
+                memories = [hit.payload.get('text', '') for hit in search_result.points if hit.payload]
+            else:
+                memories = []
+            
             return memories
         except Exception as e:
             logger.error(f"File-specific search error: {e}")
+            logger.debug(f"Error details:", exc_info=True)
             return []
     
     # NEW: Get list of uploaded files
@@ -357,9 +493,16 @@ class MemoryManager:
             search_result = self.client.query_points(
                 collection_name=self.collection_name,
                 query=vector,
-                limit=n_results
-            ).points
-            memories = [hit.payload['text'] for hit in search_result if hit.payload]
+                limit=n_results,
+                with_payload=True
+            )
+            
+            # Handle response
+            if hasattr(search_result, 'points'):
+                memories = [hit.payload.get('text', '') for hit in search_result.points if hit.payload]
+            else:
+                memories = []
+            
             return memories
         except Exception as e:
             logger.error(f"Layer Search Error: {e}")
@@ -439,11 +582,11 @@ def background_profile_update(brain, memory, profile_text, history_copy, user_in
         logger.error(f"Background Update Failed: {e}")
 
 def main():
-    print("=== Booting Up Memory System v3.7 (Enhanced File Retrieval) ===")
+    print(f"=== Booting Up Memory System v3.8 (Local API Mode + Context Overflow Management) ===")
     try:
-        router = SemanticRouter(EMBEDDING_MODEL)
-        brain = Brain(MODEL_PATH, CTX_SIZE, GPU_LAYERS)
-        memory = MemoryManager(QDRANT_URL, PROFILE_PATH, CHAT_LOG_PATH, router, brain)
+        router = SemanticRouter(LLM_API_URL)
+        brain = Brain(LLM_API_URL, CTX_SIZE)
+        memory = MemoryManager(QDRANT_PATH, PROFILE_PATH, CHAT_LOG_PATH, router, brain)
     except Exception as e:
         logger.critical(f"Startup Failed: {e}")
         return
