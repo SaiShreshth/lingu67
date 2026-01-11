@@ -1,10 +1,16 @@
 """
 Qdrant Backend - Vector storage backend for long-term memory.
+
+Uses QdrantClientManager for shared access to avoid conflicts.
 """
 
 import os
+import sys
 import logging
 from typing import List, Dict, Any, Optional
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +19,8 @@ class QdrantBackend:
     """
     Qdrant vector database backend.
     
-    Wraps Qdrant operations for memory storage.
+    Uses shared QdrantClientManager to avoid conflicts when multiple
+    components access the same Qdrant storage.
     """
     
     def __init__(
@@ -26,17 +33,21 @@ class QdrantBackend:
         self.collection_name = collection_name
         self.vector_size = vector_size
         self.client = None
+        self._lock = None
         
         self._init_client()
     
     def _init_client(self):
-        """Initialize Qdrant client."""
+        """Initialize Qdrant client via shared manager."""
         try:
-            from qdrant_client import QdrantClient
+            from server.qdrant_manager import QdrantClientManager, get_qdrant_lock
             from qdrant_client.http import models
             
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-            self.client = QdrantClient(path=self.path)
+            
+            # Use shared client
+            self.client = QdrantClientManager.get_client(self.path)
+            self._lock = get_qdrant_lock(self.path)
             
             try:
                 self.client.get_collection(self.collection_name)
@@ -50,8 +61,8 @@ class QdrantBackend:
                 )
                 logger.info(f"Created collection: {self.collection_name}")
                 
-        except ImportError:
-            logger.error("qdrant-client not installed")
+        except ImportError as e:
+            logger.error(f"Failed to initialize Qdrant client: {e}")
             self.client = None
     
     def upsert(

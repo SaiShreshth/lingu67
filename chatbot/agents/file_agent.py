@@ -120,7 +120,7 @@ class FileAgent(BaseAgent):
             context_parts = []
             for r in results:
                 source = r.get("source", "unknown")
-                content = r.get("content", "")
+                content = r.get("text", "")  # RAGHandler returns 'text', not 'content'
                 context_parts.append(f"[From {source}]:\n{content}")
             
             context_str = "\n\n".join(context_parts)

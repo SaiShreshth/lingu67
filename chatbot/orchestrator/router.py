@@ -77,6 +77,10 @@ class IntentRouter:
         """
         Route a query to the appropriate intent and agents.
         
+        All queries (except system commands) include RAG search for:
+        - Uploaded files (semantic search)
+        - Past conversations (chat history)
+        
         Args:
             query: User's query
             context: Optional context (e.g., previous intents)
@@ -86,7 +90,11 @@ class IntentRouter:
         """
         query_lower = query.lower().strip()
         
-        # Check for system commands first
+        # Base agents that are ALWAYS used for context (except system commands)
+        # This ensures uploaded files and chat history are always searched
+        base_agents = {"memory", "profile", "rag", "file"}
+        
+        # Check for system commands first (no agents needed)
         if self._is_system_command(query_lower):
             return RoutingDecision(
                 intent=Intent.SYSTEM,
@@ -99,21 +107,21 @@ class IntentRouter:
             return RoutingDecision(
                 intent=Intent.FILE_LIST,
                 confidence=0.9,
-                agents_to_use={"file"}
+                agents_to_use={"file"}  # Only file agent for listing
             )
         
         if self._is_file_delete(query_lower):
             return RoutingDecision(
                 intent=Intent.FILE_DELETE,
                 confidence=0.9,
-                agents_to_use={"file"}
+                agents_to_use={"file"}  # Only file agent for deletion
             )
         
         if self._is_file_query(query_lower):
             return RoutingDecision(
                 intent=Intent.FILE_QUERY,
                 confidence=0.8,
-                agents_to_use={"file", "memory", "profile"}
+                agents_to_use=base_agents
             )
         
         # Check for profile updates
@@ -121,7 +129,7 @@ class IntentRouter:
             return RoutingDecision(
                 intent=Intent.PROFILE_UPDATE,
                 confidence=0.8,
-                agents_to_use={"memory", "profile"}
+                agents_to_use=base_agents
             )
         
         # Check for memory recall
@@ -129,7 +137,7 @@ class IntentRouter:
             return RoutingDecision(
                 intent=Intent.MEMORY_RECALL,
                 confidence=0.7,
-                agents_to_use={"memory", "rag", "profile"}
+                agents_to_use=base_agents
             )
         
         # Check for questions
@@ -137,14 +145,14 @@ class IntentRouter:
             return RoutingDecision(
                 intent=Intent.QUESTION,
                 confidence=0.6,
-                agents_to_use={"memory", "rag", "profile", "file"}
+                agents_to_use=base_agents
             )
         
-        # Default: general chat
+        # Default: general chat - still search files and history!
         return RoutingDecision(
             intent=Intent.CHAT,
             confidence=0.5,
-            agents_to_use={"memory", "profile"}
+            agents_to_use=base_agents  # Always include rag+file for context
         )
     
     def _is_system_command(self, query: str) -> bool:

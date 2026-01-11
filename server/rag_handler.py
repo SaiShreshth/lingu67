@@ -16,9 +16,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from server.local_client import LocalLLMClient
+from server.qdrant_manager import QdrantClientManager, get_qdrant_lock
 from config import MODEL_SERVER_URL, QDRANT_PATH
 
 logging.basicConfig(level=logging.INFO)
@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 class RAGHandler:
     """
     Unified RAG (Retrieval-Augmented Generation) handler.
+    
+    Uses QdrantClientManager for shared Qdrant access, avoiding conflicts
+    when multiple components access the same Qdrant path.
     
     Provides:
     - Document/file ingestion with chunking
@@ -59,8 +62,12 @@ class RAGHandler:
         """
         self.collection = collection
         self.vector_size = vector_size
+        self.qdrant_path = qdrant_path
         self.llm = LocalLLMClient(llm_url)
-        self.qdrant = QdrantClient(path=qdrant_path)
+        
+        # Use shared Qdrant client via manager
+        self.qdrant = QdrantClientManager.get_client(qdrant_path)
+        self._lock = get_qdrant_lock(qdrant_path)
         
         self._init_collection()
         self._metadata: Dict[str, Dict] = {}

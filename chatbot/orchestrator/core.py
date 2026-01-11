@@ -96,20 +96,40 @@ class ChatOrchestrator:
     
     def _init_default_agents(self):
         """Initialize default agents."""
+        self.agents = {}
+        
+        # Initialize each agent individually to avoid one failure blocking all
         try:
             from chatbot.agents.memory_agent import MemoryAgent
-            from chatbot.agents.file_agent import FileAgent
-            from chatbot.agents.profile_agent import ProfileAgent
-            from chatbot.agents.rag_agent import RAGAgent
-            
-            self.agents = {
-                "memory": MemoryAgent(),
-                "file": FileAgent(),
-                "profile": ProfileAgent(),
-                "rag": RAGAgent()
-            }
+            # Use separate data_dir to avoid Qdrant conflicts with model_server
+            self.agents["memory"] = MemoryAgent(data_dir="data/chatbot_memory")
+            logger.info("MemoryAgent initialized")
         except Exception as e:
-            logger.warning(f"Failed to initialize some agents: {e}")
+            logger.warning(f"MemoryAgent failed: {e}")
+        
+        try:
+            from chatbot.agents.profile_agent import ProfileAgent
+            self.agents["profile"] = ProfileAgent()
+            logger.info("ProfileAgent initialized")
+        except Exception as e:
+            logger.warning(f"ProfileAgent failed: {e}")
+        
+        try:
+            from chatbot.agents.file_agent import FileAgent
+            self.agents["file"] = FileAgent()
+            logger.info("FileAgent initialized")
+        except Exception as e:
+            logger.warning(f"FileAgent failed: {e}")
+        
+        try:
+            from chatbot.agents.rag_agent import RAGAgent
+            # Use separate collection to avoid conflicts
+            self.agents["rag"] = RAGAgent(collection="chatbot_rag")
+            logger.info("RAGAgent initialized")
+        except Exception as e:
+            logger.warning(f"RAGAgent failed: {e}")
+        
+        logger.info(f"Initialized {len(self.agents)} agents: {list(self.agents.keys())}")
     
     def process(
         self, 
@@ -170,6 +190,9 @@ class ChatOrchestrator:
         """Gather context from relevant agents."""
         contexts = []
         
+        logger.info(f"=== Gathering context for: '{query[:50]}...' ===")
+        logger.info(f"Agents to use: {routing.agents_to_use}")
+        
         for agent_name in routing.agents_to_use:
             agent = self.agents.get(agent_name)
             if agent and agent.enabled:
@@ -181,9 +204,21 @@ class ChatOrchestrator:
                             ctx.metadata = {}
                         ctx.metadata["agent"] = agent_name
                         contexts.append(ctx)
+                        
+                        # Log what we got
+                        content_preview = ctx.content[:200] if ctx.content else "(empty)"
+                        logger.info(f"  [{agent_name}] ✓ Content ({len(ctx.content)} chars): {content_preview}...")
+                    else:
+                        logger.info(f"  [{agent_name}] - No context returned")
                 except Exception as e:
-                    logger.error(f"Agent '{agent_name}' failed: {e}")
+                    logger.error(f"  [{agent_name}] ✗ Failed: {e}")
+            else:
+                if not agent:
+                    logger.warning(f"  [{agent_name}] Agent not found")
+                elif not agent.enabled:
+                    logger.info(f"  [{agent_name}] Agent disabled")
         
+        logger.info(f"=== Total contexts gathered: {len(contexts)} ===")
         return contexts
     
     def _generate_response(

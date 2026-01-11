@@ -26,7 +26,8 @@ class MemoryAgent(BaseAgent):
         self, 
         scope: str = "global",
         data_dir: str = "data/memory",
-        llm_client = None
+        llm_client = None,
+        use_long_term: bool = True
     ):
         """
         Initialize memory agent.
@@ -35,19 +36,52 @@ class MemoryAgent(BaseAgent):
             scope: Memory scope (global, user:id, session:id)
             data_dir: Directory for persistent storage
             llm_client: Optional LLM client for memory management
+            use_long_term: Whether to use long-term memory (requires Qdrant)
         """
         super().__init__(name="memory")
         
-        # Import here to avoid circular dependencies
-        from memory.core import get_memory_manager
-        
         self.scope = scope
-        self._memory = get_memory_manager(
-            scope=scope,
-            llm_client=llm_client,
-            data_dir=data_dir
-        )
-        logger.info(f"MemoryAgent initialized with scope '{scope}'")
+        self._memory = None
+        self._use_long_term = use_long_term
+        
+        try:
+            # Import here to avoid circular dependencies
+            from memory.core import MemoryManager
+            
+            self._memory = MemoryManager(
+                scope=scope,
+                llm_client=llm_client,
+                data_dir=data_dir,
+                use_llm_management=False  # Disable LLM management for now
+            )
+            logger.info(f"MemoryAgent initialized with scope '{scope}'")
+        except Exception as e:
+            # If full memory fails, try without long-term (Qdrant)
+            logger.warning(f"Full memory init failed: {e}, using fallback mode")
+            self._init_fallback(scope, data_dir)
+    
+    def _init_fallback(self, scope: str, data_dir: str):
+        """Initialize fallback mode without long-term memory."""
+        try:
+            from memory.stores.short_term import ShortTermMemory
+            from memory.stores.feature_memory import FeatureMemory
+            from memory.managers.policies import ShortTermPolicy
+            import os
+            
+            self._short_term = ShortTermMemory(
+                scope=scope,
+                policy=ShortTermPolicy()
+            )
+            self._features = FeatureMemory(
+                scope=scope,
+                storage_dir=os.path.join(data_dir, "features")
+            )
+            self._fallback_mode = True
+            self._use_long_term = False
+            logger.info(f"MemoryAgent fallback mode: short-term + features only")
+        except Exception as e:
+            logger.error(f"MemoryAgent fallback also failed: {e}")
+            self._enabled = False
     
     def gather_context(
         self, 
@@ -59,7 +93,7 @@ class MemoryAgent(BaseAgent):
         
         Retrieves:
         - Short-term conversation history
-        - Long-term relevant memories (semantic search)
+        - Long-term relevant memories (semantic search) if available
         - Feature memory (user facts)
         
         Args:
@@ -73,31 +107,57 @@ class MemoryAgent(BaseAgent):
             return None
         
         try:
-            # Get combined context from memory manager
-            context = self._memory.get_context(
-                query=query,
-                max_tokens=2000,
-                include_short_term=True,
-                include_features=True,
-                include_long_term=True,
-                long_term_limit=3
-            )
-            
-            # Build context string
-            context_str = self._memory._build_combined_context(context)
-            
-            if not context_str.strip():
-                return None
-            
-            return AgentContext(
-                content=context_str,
-                metadata={
-                    "short_term_count": len(context.get("short_term", [])),
-                    "long_term_count": len(context.get("long_term", [])),
-                    "features_count": len(context.get("features", {}))
-                },
-                priority=10  # High priority - memory is important
-            )
+            # Check if using full memory manager or fallback mode
+            if self._memory is not None:
+                # Full mode with MemoryManager
+                context = self._memory.get_context(
+                    query=query,
+                    max_tokens=2000,
+                    include_short_term=True,
+                    include_features=True,
+                    include_long_term=self._use_long_term,
+                    long_term_limit=3
+                )
+                context_str = self._memory._build_combined_context(context)
+                
+                return AgentContext(
+                    content=context_str,
+                    metadata={
+                        "short_term_count": len(context.get("short_term", [])),
+                        "long_term_count": len(context.get("long_term", [])),
+                        "features_count": len(context.get("features", {}))
+                    },
+                    priority=10
+                ) if context_str.strip() else None
+            else:
+                # Fallback mode - use direct access to short-term and features
+                context_parts = []
+                
+                # Get short-term context
+                if hasattr(self, '_short_term') and self._short_term:
+                    history = self._short_term.get_context()
+                    if history:
+                        context_parts.append("=== RECENT CONVERSATION ===")
+                        for entry in history[-10:]:  # Last 10 turns
+                            role = entry.get("role", "unknown")
+                            content = entry.get("content", "")
+                            context_parts.append(f"{role.title()}: {content}")
+                
+                # Get feature memory (user facts)
+                if hasattr(self, '_features') and self._features:
+                    facts_json = self._features.to_prompt()
+                    if facts_json and facts_json != "{}":
+                        context_parts.append("\n=== USER FACTS ===")
+                        context_parts.append(facts_json)
+                
+                if not context_parts:
+                    return None
+                
+                return AgentContext(
+                    content="\n".join(context_parts),
+                    metadata={"fallback_mode": True},
+                    priority=10
+                )
             
         except Exception as e:
             logger.error(f"MemoryAgent gather_context failed: {e}")
@@ -121,19 +181,22 @@ class MemoryAgent(BaseAgent):
             return
         
         try:
-            # Add turn to all memory types
-            self._memory.add_turn(
-                user_message=user_input,
-                assistant_response=response,
-                extract_facts=True  # Auto-extract facts for feature memory
-            )
-            
-            # Check if memory management is needed
-            if self._memory.needs_management():
-                self._memory.manage_short_term()
+            if self._memory is not None:
+                # Full mode with MemoryManager
+                self._memory.add_turn(
+                    user_message=user_input,
+                    assistant_response=response,
+                    extract_facts=True
+                )
                 
-            logger.debug("MemoryAgent: Turn saved to memory")
-            
+                if self._memory.needs_management():
+                    self._memory.manage_short_term()
+            else:
+                # Fallback mode - use direct access
+                if hasattr(self, '_short_term') and self._short_term:
+                    self._short_term.add_turn(user_input, response)
+                    logger.debug("MemoryAgent: Turn saved to short-term (fallback mode)")
+                    
         except Exception as e:
             logger.error(f"MemoryAgent post_process failed: {e}")
     
