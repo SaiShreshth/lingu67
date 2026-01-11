@@ -1,0 +1,142 @@
+{
+  "timestamp": "2026-01-11T00:05:16.745400",
+  "system": {
+    "python_version": "3.11.9",
+    "platform": "win32"
+  },
+  "benchmarks": {
+    "short_term_write": {
+      "operation": "short_term_write",
+      "total_ops": 1000,
+      "total_time_s": 0.0104,
+      "ops_per_sec": 95724.0,
+      "latency": {
+        "min_ms": 0.006,
+        "max_ms": 0.083,
+        "mean_ms": 0.007,
+        "p50_ms": 0.006,
+        "p95_ms": 0.009,
+        "p99_ms": 0.083,
+        "iterations": 100
+      }
+    },
+    "short_term_read": {
+      "operation": "short_term_read",
+      "total_ops": 1000,
+      "total_time_s": 0.0655,
+      "ops_per_sec": 15255.9,
+      "latency": {
+        "min_ms": 0.064,
+        "max_ms": 0.132,
+        "mean_ms": 0.067,
+        "p50_ms": 0.065,
+        "p95_ms": 0.087,
+        "p99_ms": 0.132,
+        "iterations": 100
+      }
+    },
+    "feature_memory": {
+      "operation": "feature_memory",
+      "total_ops": 500,
+      "write_ops_per_sec": 154.5,
+      "read_ops_per_sec": 2613695.7,
+      "history_ops_per_sec": 5000000.0,
+      "write_time_s": 3.2365,
+      "read_time_s": 0.0002
+    },
+    "embedding_latency": {
+      "operation": "embedding",
+      "iterations": 30,
+      "by_text_length": {
+        "text_10_chars": {
+          "mean_ms": 20.93,
+          "p50_ms": 18.53,
+          "p95_ms": 29.82
+        },
+        "text_46_chars": {
+          "mean_ms": 17.84,
+          "p50_ms": 17.42,
+          "p95_ms": 22.74
+        },
+        "text_138_chars": {
+          "mean_ms": 18.02,
+          "p50_ms": 17.73,
+          "p95_ms": 22.02
+        }
+      }
+    },
+    "semantic_search": {
+      "operation": "semantic_search",
+      "corpus_size": 10,
+      "iterations": 30,
+      "mean_ms": 17.9,
+      "p50_ms": 17.57,
+      "p95_ms": 20.03,
+      "p99_ms": 20.61
+    },
+    "context_building": {
+      "operation": "context_building",
+      "iterations": 30,
+      "by_token_limit": {
+        "max_500_tokens": {
+          "mean_ms": 18.14,
+          "p50_ms": 17.76,
+          "p95_ms": 22.54
+        },
+        "max_1000_tokens": {
+          "mean_ms": 17.98,
+          "p50_ms": 17.7,
+          "p95_ms": 20.07
+        },
+        "max_2000_tokens": {
+          "mean_ms": 17.11,
+          "p50_ms": 16.82,
+          "p95_ms": 17.91
+        },
+        "max_4000_tokens": {
+          "mean_ms": 17.29,
+          "p50_ms": 17.28,
+          "p95_ms": 19.06
+        }
+      }
+    },
+    "llm_management": {
+      "operation": "llm_management",
+      "entries_per_call": 20,
+      "iterations": 5,
+      "mean_ms": 20434.3,
+      "p50_ms": 21331.44,
+      "p95_ms": 21564.91
+    },
+    "capacity_limits": {
+      "operation": "capacity_limits",
+      "results": {
+        "short_term": {
+          "entries": 10000,
+          "tokens": 20000,
+          "time_s": 0.15,
+          "entries_per_sec": 66070.1
+        },
+        "feature_memory": {
+          "facts": 1001,
+          "max_history_depth": 500,
+          "time_s": 15.0,
+          "facts_per_sec": 66.7
+        }
+      }
+    },
+    "end_to_end": {
+      "operation": "end_to_end_turn",
+      "iterations": 15,
+      "includes": [
+        "add_turn",
+        "fact_extraction",
+        "context_building"
+      ],
+      "mean_ms": 465.22,
+      "p50_ms": 387.56,
+      "p95_ms": 1552.52,
+      "p99_ms": 1552.52
+    }
+  }
+}
